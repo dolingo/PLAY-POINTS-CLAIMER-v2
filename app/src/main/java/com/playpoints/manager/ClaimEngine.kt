@@ -95,7 +95,6 @@ object ClaimEngine {
                         finish(ClaimResult(false, message = "انتهت المهلة، تأكد من سرعة الإنترنت"))
                     }, 35_000)
 
-                    // حقن دالة الإرسال المباشر batchexecute داخل سياق الصفحة
                     fun triggerDirectRpcClaim() {
                         val jsDirectClaim = """
                             (function() {
@@ -117,7 +116,6 @@ object ClaimEngine {
                                             return;
                                         }
 
-                                        // البحث عن معرّف الجائزة الدقيق في كود الصفحة أو تجربة كل المستويات تلقائياً
                                         var rewardIds = [];
                                         var foundMatch = html.match(/WEEKLY_REWARD_PROB_\d+/g);
                                         if (foundMatch && foundMatch.length > 0) {
@@ -149,40 +147,73 @@ object ClaimEngine {
                                             return await resp.text();
                                         }
 
+                                        // فك تشفير مصفوفة wrb.fr واستخراج النص الداخلي النظيف
+                                        function extractInnerPayload(rawResponse, targetRpcId) {
+                                            var lines = rawResponse.split('\n');
+                                            for (var k = 0; k < lines.length; k++) {
+                                                var line = lines[k].trim();
+                                                if (line.indexOf('"wrb.fr"') !== -1 && line.indexOf(targetRpcId) !== -1) {
+                                                    try {
+                                                        var arr = JSON.parse(line);
+                                                        for (var j = 0; j < arr.length; j++) {
+                                                            if (arr[j][0] === 'wrb.fr' && arr[j][1] === targetRpcId && arr[j][2]) {
+                                                                return arr[j][2];
+                                                            }
+                                                        }
+                                                    } catch (err) {}
+                                                }
+                                            }
+                                            return '';
+                                        }
+
+                                        // استخراج رقم النقاط من النص الداخلي بعد فك التشفير
+                                        function parseWonPoints(innerStr) {
+                                            if (!innerStr) return 0;
+                                            // 1. البحث عن نص مثل: "You won 5 Play Points!" أو "5 Play Points"
+                                            var txtMatch = innerStr.match(/(?:won|earned|got|\+)\s*(\d+)\s*(?:Play\s*)?Points?/i)
+                                                || innerStr.match(/(\d+)\s*Play\s*Points?/i);
+                                            if (txtMatch) return parseInt(txtMatch[1], 10);
+
+                                            // 2. البحث في بنية المصفوفة الرقمية الخاصة بالجائزة
+                                            var cleaned = innerStr.replace(/WEEKLY_REWARD_PROB_\d+/g, '');
+                                            var numMatches = cleaned.match(/[\[,]"?(\d{1,4})"?[\],]/g);
+                                            if (numMatches) {
+                                                for (var m = 0; m < numMatches.length; m++) {
+                                                    var val = parseInt(numMatches[m].replace(/\D/g, ''), 10);
+                                                    if (val >= 1 && val <= 1000) return val;
+                                                }
+                                            }
+                                            return 0;
+                                        }
+
                                         var lastRaw = '';
                                         for (var i = 0; i < rewardIds.length; i++) {
                                             var rId = rewardIds[i];
-                                            // 1. طلب التهيئة xnSgJb
                                             await callRpc('xnSgJb', [null, [null, null, null, null, [rId]]]);
-                                            // 2. طلب الاستلام الفعلي nTRzR
                                             var resText = await callRpc('nTRzR', [null, null, [null, null, null, null, [rId]]]);
                                             lastRaw = resText;
 
-                                            // التحقق من نجاح الاستلام في رد الخادم
-                                            if (resText.indexOf('"wrb.fr"') !== -1 && resText.indexOf(rId) !== -1) {
-                                                // استخراج النقاط من الرد إن وجدت
-                                                var ptsMatch = resText.match(/\[(\d{1,4}),null,null/);
-                                                var pts = ptsMatch ? parseInt(ptsMatch[1], 10) : 0;
-                                                if (pts > 0 || resText.indexOf('null,null,null,null,null') === -1) {
+                                            var innerData = extractInnerPayload(resText, 'nTRzR');
+                                            if (innerData && innerData.indexOf(rId) !== -1) {
+                                                var pts = parseWonPoints(innerData);
+                                                if (pts > 0 || innerData.indexOf('null,null,null,null,null') === -1) {
                                                     window.__claimRpcResult = JSON.stringify({
                                                         status: 'SUCCESS',
                                                         rewardId: rId,
-                                                        pts: pts,
-                                                        raw: resText.substring(0, 220)
+                                                        pts: pts
                                                     });
                                                     return;
                                                 }
                                             }
                                         }
 
-                                        // فحص إذا كانت مستلمة مسبقاً من نص الصفحة
                                         var lowerBody = (document.body.innerText || '').toLowerCase();
                                         if (lowerBody.indexOf('available on friday') !== -1 || lowerBody.indexOf('check back on friday') !== -1) {
                                             window.__claimRpcResult = JSON.stringify({ status: 'ALREADY_CLAIMED' });
                                         } else {
                                             window.__claimRpcResult = JSON.stringify({
                                                 status: 'FAILED',
-                                                raw: lastRaw.replace(/\s+/g, ' ').substring(0, 220)
+                                                raw: lastRaw.replace(/\s+/g, ' ').substring(0, 200)
                                             });
                                         }
                                     } catch (e) {
@@ -219,7 +250,6 @@ object ClaimEngine {
                                     when (status) {
                                         "SUCCESS" -> {
                                             val pts = obj?.optInt("pts", 0) ?: 0
-                                            val rId = obj?.optString("rewardId", "") ?: ""
                                             val freshCookies = AccountStore.captureCurrentCookiesJson()
                                             if (freshCookies.contains("SID=")) {
                                                 account.cookiesJson = freshCookies
@@ -229,9 +259,9 @@ object ClaimEngine {
                                             AccountStore.addOrUpdate(context, account)
 
                                             val msg = if (pts > 0) {
-                                                "حصلت على +$pts نقاط ✓ ($rId)"
+                                                "حصلت على +$pts نقاط ✓"
                                             } else {
-                                                "تم استلام الجائزة الأسبوعية بنجاح ✓ ($rId)"
+                                                "تم استلام الجائزة الأسبوعية بنجاح ✓"
                                             }
                                             finish(ClaimResult(success = true, pointsCount = pts, message = msg))
                                         }
